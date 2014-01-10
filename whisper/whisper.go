@@ -30,7 +30,6 @@ type Metadata struct {
 	ArchiveCount uint32
 }
 
-
 const (
 	DefaultXFilesFactor      = 0.5
 	DefaultAggregationMethod = AggregationAverage
@@ -101,8 +100,8 @@ type reverseArchive struct{ archive }
 func (r reverseArchive) Less(i, j int) bool { return r.archive.Less(j, i) }
 
 var (
-	pointSize       = uint32(binary.Size(Point{}))
-	metadataSize    = uint32(binary.Size(Metadata{}))
+	pointSize    = uint32(binary.Size(Point{}))
+	metadataSize = uint32(binary.Size(Metadata{}))
 )
 
 // readHeader attempts to read the header of a Whisper database.

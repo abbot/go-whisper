@@ -141,4 +141,3 @@ var (
 	}
 	archiveInfoSize = uint32(binary.Size(ArchiveInfo{}))
 )
-
