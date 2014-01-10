@@ -11,9 +11,7 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"regexp"
 	"sort"
-	"strings"
 	"time"
 )
 
@@ -32,63 +30,6 @@ type Metadata struct {
 	ArchiveCount uint32
 }
 
-// ArchiveInfo holds metadata about a single archive within a whisper database
-type ArchiveInfo struct {
-	Offset          uint32 // The byte offset of the archive within the database
-	SecondsPerPoint uint32 // The number of seconds of elapsed time represented by a data point
-	Points          uint32 // The number of data points
-}
-
-// NewArchiveInfo returns a new ArchiveInfo with a zero offset.
-func NewArchiveInfo(secondsPerPoint, points uint32) ArchiveInfo {
-	return ArchiveInfo{SecondsPerPoint: secondsPerPoint, Points: points}
-}
-
-// Retention is the retention period of the archive in seconds.
-func (a ArchiveInfo) Retention() uint32 {
-	return a.SecondsPerPoint * a.Points
-}
-
-// Size is the size of the archive in bytes.
-func (a ArchiveInfo) Size() uint32 {
-	return a.Points * pointSize
-}
-
-// end is the byte offset of the last point in the archive.
-func (a ArchiveInfo) end() uint32 {
-	return a.Offset + a.Size()
-}
-
-// The AggregationMethod type describes how values are aggregated from one Whisper archive to another.
-type AggregationMethod uint32
-
-func (m AggregationMethod) String() (s string) {
-	switch m {
-	case AggregationAverage:
-		s = "average"
-	case AggregationSum:
-		s = "sum"
-	case AggregationLast:
-		s = "last"
-	case AggregationMin:
-		s = "min"
-	case AggregationMax:
-		s = "max"
-	default:
-		s = "unknown"
-	}
-	return
-}
-
-// Valid aggregation methods
-const (
-	AggregationUnknown AggregationMethod = 0 // Unknown aggregation method
-	AggregationAverage AggregationMethod = 1 // Aggregate using averaging
-	AggregationSum     AggregationMethod = 2 // Aggregate using sum
-	AggregationLast    AggregationMethod = 3 // Aggregate using the last value
-	AggregationMax     AggregationMethod = 4 // Aggregate using the maximum value
-	AggregationMin     AggregationMethod = 5 // Aggregate using the minimum value
-)
 
 const (
 	DefaultXFilesFactor      = 0.5
@@ -145,14 +86,6 @@ type Whisper struct {
 	file   io.ReadWriteSeeker
 }
 
-// type for sorting a list of ArchiveInfo by the SecondsPerPoint field
-type bySecondsPerPoint []ArchiveInfo
-
-// sort.Interface
-func (a bySecondsPerPoint) Len() int           { return len(a) }
-func (a bySecondsPerPoint) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
-func (a bySecondsPerPoint) Less(i, j int) bool { return a[i].SecondsPerPoint < a[j].SecondsPerPoint }
-
 // a list of points
 type archive []Point
 
@@ -170,11 +103,7 @@ func (r reverseArchive) Less(i, j int) bool { return r.archive.Less(j, i) }
 var (
 	pointSize       = uint32(binary.Size(Point{}))
 	metadataSize    = uint32(binary.Size(Metadata{}))
-	archiveInfoSize = uint32(binary.Size(ArchiveInfo{}))
 )
-
-// a regular expression matching a precision string such as 120y
-var precisionRegexp = regexp.MustCompile("^(\\d+)([smhdwy]?)")
 
 // readHeader attempts to read the header of a Whisper database.
 func readHeader(buf io.ReadSeeker) (header Header, err error) {
@@ -210,62 +139,6 @@ var (
 	ErrInsufficientPoints = errors.New("archive has insufficient points to aggregate to a lower precision")
 )
 
-/*
-
-validateArchiveList validates a list of ArchiveInfos.
-
-The list must:
-
-1. Have at least one ArchiveInfo
-
-2. No archive may be a duplicate of another.
-
-3. Higher precision archives' precision must evenly divide all lower precision archives' precision.
-
-4. Lower precision archives must cover larger time intervals than higher precision archives.
-
-5. Each archive must have at least enough points to consolidate to the next archive
-
-*/
-func validateArchiveList(archives []ArchiveInfo) error {
-	sort.Sort(bySecondsPerPoint(archives))
-
-	// 1.
-	if len(archives) == 0 {
-		return ErrNoArchives
-	}
-
-	for i := 0; i < len(archives)-1; i++ {
-		archive := archives[i]
-		nextArchive := archives[i+1]
-
-		// 2.
-		if archive.SecondsPerPoint == nextArchive.SecondsPerPoint {
-			return ErrDuplicateArchive
-		}
-
-		// 3.
-		if nextArchive.SecondsPerPoint%archive.SecondsPerPoint != 0 {
-			return ErrUnevenPrecision
-		}
-
-		// 4.
-		nextRetention := nextArchive.Retention()
-		retention := archive.Retention()
-		if !(nextRetention > retention) {
-			return ErrLowRetention
-		}
-
-		// 5.
-		if !(archive.Points >= (nextArchive.SecondsPerPoint / archive.SecondsPerPoint)) {
-			return ErrInsufficientPoints
-		}
-
-	}
-	return nil
-
-}
-
 // CreateOptions sets the options used to create a new archive.
 type CreateOptions struct {
 	// The XFiles factor to use. DefaultXFilesFactor if not set.
@@ -285,7 +158,7 @@ func headerSize(n int) uint32 {
 
 // Create attempts to create a new database at the given filepath.
 func Create(path string, archives []ArchiveInfo, options CreateOptions) (*Whisper, error) {
-	if err := validateArchiveList(archives); err != nil {
+	if err := ArchiveInfos(archives).Validate(); err != nil {
 		return nil, err
 	}
 
@@ -781,70 +654,6 @@ func (w *Whisper) pointOffset(archive ArchiveInfo, timestamp uint32) (offset uin
 	pointDistance := timeDistance / archive.SecondsPerPoint
 	byteDistance := pointDistance * pointSize
 	return archive.Offset + (byteDistance % archive.Size()), nil
-}
-
-/*
-ParseArchiveInfo returns an ArchiveInfo represented by the string.
-
-The string must consist of two numbers, the precision and retention, separated by a colon (:).
-
-Both the precision and retention strings accept a unit suffix. Acceptable suffixes are: "s" for second,
-"m" for minute, "h" for hour, "d" for day, "w" for week, and "y" for year.
-
-The precision string specifies how large of a time interval is represented by a single point in the archive.
-
-The retention string specifies how long points are kept in the archive. If no suffix is given for the retention
-it is taken to mean a number of points and not a duration.
-
-*/
-func ParseArchiveInfo(archiveString string) (ArchiveInfo, error) {
-	a := ArchiveInfo{}
-	c := strings.Split(archiveString, ":")
-	if len(c) != 2 {
-		return a, fmt.Errorf("could not parse: %s", archiveString)
-	}
-
-	precision := c[0]
-	retention := c[1]
-
-	parsedPrecision := precisionRegexp.FindStringSubmatch(precision)
-	if parsedPrecision == nil {
-		return a, fmt.Errorf("invalid precision string: %s", precision)
-	}
-
-	secondsPerPoint, err := parseUint32(parsedPrecision[1])
-	if err != nil {
-		return a, err
-	}
-
-	if parsedPrecision[2] != "" {
-		secondsPerPoint, err = expandUnits(secondsPerPoint, parsedPrecision[2])
-		if err != nil {
-			return a, err
-		}
-	}
-
-	parsedPoints := precisionRegexp.FindStringSubmatch(retention)
-	if parsedPoints == nil {
-		return a, fmt.Errorf("invalid retention string: %s", precision)
-	}
-
-	points, err := parseUint32(parsedPoints[1])
-	if err != nil {
-		return a, err
-	}
-
-	var retentionSeconds uint32
-	if parsedPoints[2] != "" {
-		retentionSeconds, err = expandUnits(points, parsedPoints[2])
-		if err != nil {
-			return a, err
-		}
-		points = retentionSeconds / secondsPerPoint
-	}
-
-	a = ArchiveInfo{0, secondsPerPoint, points}
-	return a, nil
 }
 
 // quantizeArchive returns a copy of arc with all the points quantized to the given resolution.
