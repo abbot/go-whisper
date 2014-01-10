@@ -22,6 +22,7 @@ func (a ArchiveInfo) Retention() uint32        { return a.SecondsPerPoint * a.Po
 func (a ArchiveInfo) Size() uint32             { return a.Points * pointSize }
 func (a ArchiveInfo) end() uint32              { return a.Offset + a.Size() }
 func (a *ArchiveInfo) Write(w io.Writer) error { return binary.Write(w, binary.BigEndian, a) }
+func (a *ArchiveInfo) Read(r io.Reader) error  { return binary.Read(r, binary.BigEndian, a) }
 
 type ArchiveInfos []ArchiveInfo
 

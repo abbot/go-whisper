@@ -131,7 +131,7 @@ func TestArchiveHeader(t *testing.T) {
 		t.Fatal("failed to create database:", err)
 	}
 
-	hSize := headerSize(2)
+	hSize := metadataSize + (archiveInfoSize * uint32(2))
 	verifyHeader := func(w *Whisper) {
 		meta := w.Header.Metadata
 		expectedMeta := Metadata{AggregationAverage, 60 * 60, 0.5, 2}

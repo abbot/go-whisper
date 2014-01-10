@@ -30,9 +30,13 @@ type Metadata struct {
 	ArchiveCount uint32
 }
 
+func (m *Metadata) Write(w io.Writer) error { return binary.Write(w, binary.BigEndian, m) }
+func (m *Metadata) Read(r io.Reader) error  { return binary.Read(r, binary.BigEndian, m) }
+
 const (
 	DefaultXFilesFactor      = 0.5
 	DefaultAggregationMethod = AggregationAverage
+	chunkSize                = 16 * 1024
 )
 
 // Header contains all the metadata about a whisper database.
@@ -93,6 +97,22 @@ func (a archive) Len() int           { return len(a) }
 func (a archive) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
 func (a archive) Less(i, j int) bool { return a[i].Timestamp < a[j].Timestamp }
 
+// reading and writing
+func (a archive) Read(r io.Reader) error  { return binary.Read(r, binary.BigEndian, a) }
+func (a archive) ReadAt(r io.ReadSeeker, offset uint32) error {
+	if _, err := r.Seek(int64(offset), 0); err != nil {
+		return err
+	}
+	return a.Read(r)
+}
+func (a archive) Write(w io.Writer) error { return binary.Write(w, binary.BigEndian, a) }
+func (a archive) WriteAt(w io.WriteSeeker, offset uint32) error {
+	if _, err := w.Seek(int64(offset), 0); err != nil {
+		return err
+	}
+	return a.Write(w)
+}
+
 // a type for reverse sorting of archives
 type reverseArchive struct{ archive }
 
@@ -112,7 +132,7 @@ func readHeader(buf io.ReadSeeker) (header Header, err error) {
 	}
 
 	var metadata Metadata
-	err = binary.Read(buf, binary.BigEndian, &metadata)
+	err = metadata.Read(buf)
 	if err != nil {
 		return
 	}
@@ -120,7 +140,7 @@ func readHeader(buf io.ReadSeeker) (header Header, err error) {
 
 	archives := make([]ArchiveInfo, metadata.ArchiveCount)
 	for i := uint32(0); i < metadata.ArchiveCount; i++ {
-		err = binary.Read(buf, binary.BigEndian, &archives[i])
+		err = archives[i].Read(buf)
 		if err != nil {
 			return
 		}
@@ -150,11 +170,6 @@ type CreateOptions struct {
 	Sparse bool
 }
 
-// headerSize calculates the size of a header with n archives
-func headerSize(n int) uint32 {
-	return metadataSize + (archiveInfoSize * uint32(n))
-}
-
 // Create attempts to create a new database at the given filepath.
 func Create(path string, archives []ArchiveInfo, options CreateOptions) (*Whisper, error) {
 	if err := ArchiveInfos(archives).Validate(); err != nil {
@@ -173,47 +188,56 @@ func Create(path string, archives []ArchiveInfo, options CreateOptions) (*Whispe
 		options.AggregationMethod = DefaultAggregationMethod
 	}
 
-	oldest := uint32(0)
-	for _, archive := range archives {
-		age := archive.SecondsPerPoint * archive.Points
-		if age > oldest {
-			oldest = age
-		}
+	offset := metadataSize + archiveInfoSize*uint32(len(archives))
+	retentions := make([]int, len(archives))
+	for i, a := range archives {
+		archives[i].Offset = offset
+		offset += a.Points * pointSize
+		retentions[i] = int(a.SecondsPerPoint * a.Points)
 	}
+	sort.Ints(retentions)
 
 	metadata := Metadata{
 		AggregationMethod: options.AggregationMethod,
 		XFilesFactor:      options.XFilesFactor,
 		ArchiveCount:      uint32(len(archives)),
-		MaxRetention:      oldest,
+		MaxRetention:      uint32(retentions[len(retentions)-1]),
 	}
-	if err := binary.Write(file, binary.BigEndian, metadata); err != nil {
+	if err := metadata.Write(file); err != nil {
 		return nil, err
 	}
 
-	hSize := headerSize(len(archives))
-	archiveOffsetPointer := hSize
-
-	for _, archive := range archives {
-		archive.Offset = archiveOffsetPointer
-		if err := binary.Write(file, binary.BigEndian, archive); err != nil {
+	for _, a := range archives {
+		if err = a.Write(file); err != nil {
 			return nil, err
 		}
-		archiveOffsetPointer += archive.Points * pointSize
 	}
 
+	last := archives[len(archives)-1]
+	fileSize := int64(last.Offset + last.Points*pointSize)
 	if options.Sparse {
-		file.Seek(int64(archiveOffsetPointer-hSize-1), 0)
-		file.Write([]byte{0})
-	} else {
-		remaining := archiveOffsetPointer - hSize
-		chunkSize := uint32(16384)
-		buf := make([]byte, chunkSize)
-		for remaining > chunkSize {
-			file.Write(buf)
-			remaining -= chunkSize
+		if _, err = file.Seek(fileSize-1, 0); err != nil {
+			return nil, err
 		}
-		file.Write(buf[:remaining])
+		if _, err = file.Write([]byte{0}); err != nil {
+			return nil, err
+		}
+	} else {
+		pos, err := file.Seek(0, 1)
+		if err != nil {
+			return nil, err
+		}
+		left := fileSize - pos
+		zeros := make([]byte, chunkSize)
+		for left > chunkSize {
+			if _, err = file.Write(zeros); err != nil {
+				return nil, err
+			}
+			left -= chunkSize
+		}
+		if _, err = file.Write(zeros[:left]); err != nil {
+			return nil, err
+		}
 	}
 
 	return OpenWhisper(file)
@@ -255,7 +279,7 @@ func (w *Whisper) DumpArchive(n int) ([]Point, error) {
 
 	info := w.Header.Archives[n]
 	points := make([]Point, int(info.Points))
-	err := w.readPoints(info.Offset, points)
+	err := archive(points).ReadAt(w.file, info.Offset)
 	return points, err
 }
 
@@ -552,56 +576,31 @@ func (w *Whisper) SetAggregationMethod(m AggregationMethod) error {
 	if _, err := w.file.Seek(0, 0); err != nil {
 		return err
 	}
-	if err := binary.Write(w.file, binary.BigEndian, meta); err != nil {
+	if err := meta.Write(w.file); err != nil {
 		return err
 	}
 	w.Header.Metadata = meta
 	return nil
 }
 
-// readPoint reads a single point from an offset in the database.
-func (w *Whisper) readPoint(offset uint32) (point Point, err error) {
-	points := make([]Point, 1)
-	err = w.readPoints(offset, points)
-	point = points[0]
-	return
-}
-
-// readPoints fills a slice of points with data from an offset in the database.
-func (w *Whisper) readPoints(offset uint32, points []Point) error {
-	_, err := w.file.Seek(int64(offset), 0)
-	if err != nil {
-		return err
-	}
-	return binary.Read(w.file, binary.BigEndian, points)
-}
-
-// writePoints writes a slice of points at an offset in the database.
-func (w *Whisper) writePoints(offset uint32, points []Point) error {
-	if _, err := w.file.Seek(int64(offset), 0); err != nil {
-		return err
-	}
-	return binary.Write(w.file, binary.BigEndian, points)
-}
-
-func (w *Whisper) readPointsBetweenOffsets(archive ArchiveInfo, startOffset, endOffset uint32) (points []Point, err error) {
-	archiveStart := archive.Offset
-	archiveEnd := archive.end()
+func (w *Whisper) readPointsBetweenOffsets(a ArchiveInfo, startOffset, endOffset uint32) (points []Point, err error) {
+	archiveStart := a.Offset
+	archiveEnd := a.end()
 	if startOffset < endOffset {
 		// The selection is in the middle of the archive. eg: --####---
 		points = make([]Point, (endOffset-startOffset)/pointSize)
-		err = w.readPoints(startOffset, points)
+		err = archive(points).ReadAt(w.file, startOffset)
 	} else {
 		// The selection wraps over the end of the archive. eg: ##----###
 		numEndPoints := (archiveEnd - startOffset) / pointSize
 		numBeginPoints := (endOffset - archiveStart) / pointSize
 		points = make([]Point, numBeginPoints+numEndPoints)
 
-		err = w.readPoints(startOffset, points[:numEndPoints])
+		err = archive(points[:numEndPoints]).ReadAt(w.file, startOffset)
 		if err != nil {
 			return
 		}
-		err = w.readPoints(archiveStart, points[numEndPoints:])
+		err = archive(points[numEndPoints:]).ReadAt(w.file, archiveStart)
 	}
 	return
 }
@@ -609,50 +608,52 @@ func (w *Whisper) readPointsBetweenOffsets(archive ArchiveInfo, startOffset, end
 // writeArchive write points to an archive.
 // It assumes the points are in chronological order and at intervals matching the archive's resolution.
 // The offset is determined by the timestamp of the first point.
-func (w *Whisper) writeArchive(archive ArchiveInfo, points ...Point) error {
+func (w *Whisper) writeArchive(a ArchiveInfo, points ...Point) error {
 	nPoints := uint32(len(points))
 
 	// Sanity check
-	if nPoints > archive.Points {
-		return fmt.Errorf("archive can store at most %d points, %d supplied", archive.Points, nPoints)
+	if nPoints > a.Points {
+		return fmt.Errorf("archive can store at most %d points, %d supplied", a.Points, nPoints)
 	}
 
-	offset, err := w.pointOffset(archive, points[0].Timestamp)
+	offset, err := w.pointOffset(a, points[0].Timestamp)
 	if err != nil {
 		return err
 	}
 
-	maxPointsFromOffset := (archive.end() - offset) / pointSize
+	maxPointsFromOffset := (a.end() - offset) / pointSize
 	if nPoints > maxPointsFromOffset {
 		// Points span the beginning and end of the archive, eg: ##----###
-		if err = w.writePoints(offset, points[:maxPointsFromOffset]); err != nil {
+		if err = archive(points[:maxPointsFromOffset]).WriteAt(w.file, offset); err != nil {
 			return err
 		}
-		err = w.writePoints(archive.Offset, points[maxPointsFromOffset:])
+		err = archive(points[maxPointsFromOffset:]).WriteAt(w.file, a.Offset)
 	} else {
 		// Points are in the middle of the archive, eg: --####---
-		err = w.writePoints(offset, points)
+		err = archive(points).WriteAt(w.file, offset)
 	}
 
 	return err
 }
 
 // pointOffset returns the offset of a timestamp within an archive
-func (w *Whisper) pointOffset(archive ArchiveInfo, timestamp uint32) (offset uint32, err error) {
-	basePoint, err := w.readPoint(archive.Offset)
+func (w *Whisper) pointOffset(a ArchiveInfo, timestamp uint32) (offset uint32, err error) {
+	p := make([]Point, 1)
+	err = archive(p).ReadAt(w.file, a.Offset)
 	if err != nil {
 		return 0, err
 	}
+	basePoint := p[0]
 
 	if basePoint.Timestamp == 0 {
 		// The archive has never been written, this will be the new base point
-		return archive.Offset, nil
+		return a.Offset, nil
 	}
 
 	timeDistance := timestamp - basePoint.Timestamp
-	pointDistance := timeDistance / archive.SecondsPerPoint
+	pointDistance := timeDistance / a.SecondsPerPoint
 	byteDistance := pointDistance * pointSize
-	return archive.Offset + (byteDistance % archive.Size()), nil
+	return a.Offset + (byteDistance % a.Size()), nil
 }
 
 // quantizeArchive returns a copy of arc with all the points quantized to the given resolution.
